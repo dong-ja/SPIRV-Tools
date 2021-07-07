@@ -171,6 +171,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   ir_context.cpp
   ir_loader.cpp
   licm_pass.cpp
+  linter.cpp
   local_access_chain_convert_pass.cpp
   local_redundancy_elimination.cpp
   local_single_block_elim_pass.cpp
