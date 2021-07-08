@@ -68,6 +68,20 @@ bool Linter::Run(const uint32_t *binary, const size_t binary_size) const {
 
   int num = 0;
 
+  opt::CFG *cfg = context->cfg();
+  for (opt::Function &func : *context->module()) {
+    cout << "// CFG\n";
+    cout << "digraph {\n";
+    cfg->ForEachBlockInPostOrder(func.entry().get(), [](opt::BasicBlock *bb) {
+      uint32_t label =bb->GetLabelInst()->result_id();
+      cout << "  " << label << " [color = red];\n";
+      bb->ForEachSuccessorLabel([=](const uint32_t succ) {
+        cout << label << " -> " << succ << ";\n";
+      });
+    });
+    cout << "}\n";
+  }
+
   context->module()->ForEachInst([&](const opt::Instruction *inst) {
     if (!instructionHasDerivative(inst)) return;
     if (num < 100) {
