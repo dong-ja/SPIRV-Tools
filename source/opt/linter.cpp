@@ -14,8 +14,12 @@
 
 #include <algorithm>
 #include <iostream>
+#include <sstream>
 
+#include "source/opcode.h"
+#include "source/opt/basic_block.h"
 #include "source/opt/build_module.h"
+#include "source/opt/dominator_analysis.h"
 #include "source/opt/ir_context.h"
 #include "spirv-tools/linter.hpp"
 #include "spirv-tools/libspirv.hpp"
@@ -60,6 +64,64 @@ const MessageConsumer &Linter::consumer() const {
 
 Linter::~Linter() {}
 
+template<typename T>
+void extendVector(std::vector<T> *out, const std::vector<T> &in) {
+  out->reserve(out->size() + in.size());
+  out->insert(out->end(), in.begin(), in.end());
+}
+
+struct CDEdge {
+  uint32_t parent;
+  std::string type;
+};
+
+CDEdge edgeFromNodes(const opt::CFG *cfg, uint32_t src, uint32_t dst) {
+  CDEdge ret;
+  ret.parent = dst;
+  opt::BasicBlock *bb = cfg->block(dst);
+  const opt::Instruction &branch = *bb->rbegin();
+  std::ostringstream os;
+  switch (branch.opcode()) {
+    case SpvOpBranch:
+      os << "UC";
+      break;
+    case SpvOpBranchConditional:
+      {
+        uint32_t label_true = branch.GetSingleWordInOperand(1);
+        uint32_t label_false = branch.GetSingleWordInOperand(2);
+        if (src == label_true && src == label_false) {
+          os << "TF"; // shouldn't happen
+        } else if (src == label_true) {
+          os << "T";
+        } else if (src == label_false) {
+          os << "F";
+        } else {
+          os << "??";
+        }
+      }
+      break;
+    case SpvOpSwitch:
+      {
+        uint32_t num_labels = (branch.NumInOperands() - 2) / 2;
+        for (uint32_t i = 0; i < num_labels; i++) {
+          uint32_t label = branch.GetSingleWordInOperand(2 + 2 * i + 1);
+          if (label == src) {
+            os << "(" << branch.GetSingleWordInOperand(2 + 2 * i) << ")";
+          }
+        }
+        if (branch.GetSingleWordOperand(1) == src) {
+          os << "def";
+        }
+      }
+      break;
+    default:
+      os << "?opcode " << branch.opcode();
+      break;
+  }
+  ret.type = os.str();
+  return ret;
+}
+
 bool Linter::Run(const uint32_t *binary, const size_t binary_size) const {
   using std::cout;
   std::unique_ptr<opt::IRContext> context = BuildModule(
@@ -70,16 +132,56 @@ bool Linter::Run(const uint32_t *binary, const size_t binary_size) const {
 
   opt::CFG *cfg = context->cfg();
   for (opt::Function &func : *context->module()) {
-    cout << "// CFG\n";
+    cout << "// BEGIN CFG\n";
+    opt::PostDominatorAnalysis *pdom = context->GetPostDominatorAnalysis(&func);
+    // Compute post-dominance frontiers.
+    // Algorithm from
+    // "Efficiently Computing Single Static Assignment Form and the Control
+    // Dependence Graph", Cytron et al 1991.
+    std::map<uint32_t, std::vector<CDEdge>> df;
+    for (auto it = pdom->GetDomTree().post_cbegin(); it != pdom->GetDomTree().post_cend(); it++) {
+      uint32_t label = it->id();
+      std::vector<CDEdge> &out = df[label];
+      out.reserve(out.size() + cfg->preds(label).size());
+      for (uint32_t pred : cfg->preds(label)) {
+        out.push_back(edgeFromNodes(cfg, label, pred));
+      }
+      for (auto &child : *it) {
+        const std::vector<CDEdge> &child_edges = df[child->id()];
+        out.reserve(out.size() + child_edges.size());
+        for (CDEdge edge : child_edges) {
+          std::ostringstream os;
+          os << "up " << child->id() << "[" << edge.type << "]";
+          edge.type = os.str();
+          out.push_back(edge);
+        }
+      }
+      out.erase(std::remove_if(out.begin(), out.end(), [=](CDEdge &e) {
+        return pdom->StrictlyDominates(label, e.parent);
+      }), out.end());
+    }
     cout << "digraph {\n";
-    cfg->ForEachBlockInPostOrder(func.entry().get(), [](opt::BasicBlock *bb) {
-      uint32_t label =bb->GetLabelInst()->result_id();
+    cfg->ForEachBlockInPostOrder(func.entry().get(), [=, &df](opt::BasicBlock *bb) {
+      uint32_t label = bb->id();
+      // draw immediate post-dominators
+      uint32_t ipdom = pdom->ImmediateDominator(label)->id();
+      cout << "  " << label << " -> " << ipdom << " [color=red];\n";
       cout << "  " << label << " [color = red];\n";
+      // draw successors in CFG
       bb->ForEachSuccessorLabel([=](const uint32_t succ) {
-        cout << label << " -> " << succ << ";\n";
+        if (pdom->StrictlyDominates(succ, label)) {
+          cout << label << " -> " << succ << ";\n";
+        } else {
+          cout << label << " -> " << succ << " [style=dashed];\n";
+        }
       });
+      // draw post-dominance frontiers
+      for (const CDEdge &e : df[label]) {
+        cout << label << " -> " << e.parent << " [color=blue, constraint=false, label=\"" << e.type << "\"];\n";
+      }
     });
     cout << "}\n";
+    cout << "// END CFG\n";
   }
 
   context->module()->ForEachInst([&](const opt::Instruction *inst) {
