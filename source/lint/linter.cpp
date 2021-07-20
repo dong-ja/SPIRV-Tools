@@ -146,6 +146,9 @@ bool Linter::Run(const uint32_t *binary, const size_t binary_size) const {
     DivergenceGraph divergent_blocks;
     DivergenceGraph divergent_values;
     for (opt::BasicBlock *bb : order) {
+      if (!cdg.DoesBlockExist(bb->id())) {
+        continue;
+      }
       bool block_divergent = false;
       for (opt::ControlDependence dep : cdg.GetDependees(bb->id())) {
         if (divergent_blocks.count(dep.source)) {

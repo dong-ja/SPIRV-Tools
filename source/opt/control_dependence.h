@@ -91,6 +91,13 @@ class ControlDependenceGraph {
     return reverse_nodes_.at(block);
   }
 
+  // Does the block |id| exist in this graph? This can be false even if the
+  // block exists in the function when it is part of an infinite loop, as then
+  // it is not part of the post-dominator tree.
+  bool DoesBlockExist(uint32_t id) const {
+    return forward_nodes_.count(id) > 0;
+  }
+
   // Runs the function |f| on each block label in the CDG. If any iteration
   // returns false, immediately stops iteration and returns false. Otherwise
   // returns true.
