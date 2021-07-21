@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <functional>
 #include <iostream>
 #include <sstream>
 
@@ -23,12 +24,15 @@
 #include "source/opt/build_module.h"
 #include "source/opt/cfg.h"
 #include "source/opt/control_dependence.h"
+#include "source/opt/def_use_manager.h"
 #include "source/opt/dominator_analysis.h"
+#include "source/opt/function.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_context.h"
 #include "spirv-tools/libspirv.h"
 #include "spirv-tools/linter.hpp"
 #include "spirv-tools/libspirv.hpp"
+#include "spirv/unified1/spirv.h"
 
 namespace {
 bool InstructionHasDerivative(const spvtools::opt::Instruction &inst) {
@@ -50,6 +54,27 @@ bool InstructionHasDerivative(const spvtools::opt::Instruction &inst) {
   return std::find(std::begin(derivative_opcodes), std::end(derivative_opcodes), inst.opcode()) != std::end(derivative_opcodes);
 }
 
+bool InstructionIsDivergent(const spvtools::opt::Instruction &inst) {
+  static const SpvOp divergent_opcodes[] = {
+    // function parameters
+    SpvOpFunctionParameter,
+    // memory loads
+    SpvOpLoad,
+  };
+  return std::find(std::begin(divergent_opcodes), std::end(divergent_opcodes), inst.opcode()) != std::end(divergent_opcodes);
+}
+
+bool InstructionIsNeverDivergent(const spvtools::opt::Instruction &inst) {
+  static const SpvOp never_divergent_opcodes[] = {
+    // most subgroup operations
+    SpvOpSubgroupBallotKHR,
+    // TODO
+  };
+  return std::find(std::begin(never_divergent_opcodes),
+                   std::end(never_divergent_opcodes), inst.opcode()) !=
+      std::end(never_divergent_opcodes);
+}
+
 enum class IDType {
   kIDBlock,
   kIDValue,
@@ -63,14 +88,6 @@ struct DivergenceEdge {
 };
 
 using DivergenceGraph = std::map<uint32_t, DivergenceEdge>;
-
-bool IsValueDivergent(uint32_t id, DivergenceGraph &divergent_values) {
-  if (divergent_values.count(id)) {
-    return true;
-  }
-  divergent_values[id] = { IDType::kIDValue, 0, 0 }; // root
-  return true;
-}
 
 void PrintDivergenceFlow(spvtools::MessageConsumer &consumer, spvtools::opt::CFG &cfg, spvtools::opt::analysis::DefUseManager &def_use, DivergenceGraph blocks, DivergenceGraph values, IDType id_type, uint32_t id) {
   while (id != 0) {
@@ -109,6 +126,158 @@ void PrintDivergenceFlow(spvtools::MessageConsumer &consumer, spvtools::opt::CFG
     }
   }
 }
+
+class DivergenceDataFlowAnalysis {
+ public:
+  enum class VisitResult {
+    kResultChanged,
+    kResultFixed,
+  };
+
+  DivergenceDataFlowAnalysis(spvtools::opt::IRContext &context, spvtools::opt::ControlDependenceGraph &cdg)
+      : blocks_(), values_(), on_worklist_(), worklist_(),
+      def_use_(*context.get_def_use_mgr()), cfg_(*context.cfg()),
+      context_(context), cdg_(cdg) {}
+
+  bool IsBlockDivergent(uint32_t id) const {
+    return blocks_.count(id) > 0;
+  }
+
+  DivergenceGraph &divergent_block_graph() {
+    return blocks_;
+  }
+
+  DivergenceGraph &divergent_value_graph() {
+    return values_;
+  }
+
+ private:
+  void InitializeWorklist(spvtools::opt::Function *function) {
+    for (spvtools::opt::Instruction &inst : context_.types_values()) {
+      Enqueue(&inst);
+    }
+    cfg_.ForEachBlockInReversePostOrder(function->entry().get(), [this](spvtools::opt::BasicBlock *bb) {
+      for (spvtools::opt::Instruction &inst : *bb) {
+        Enqueue(&inst);
+      }
+    });
+  }
+
+  void ForEachSuccessor(spvtools::opt::Instruction *inst, std::function<void(spvtools::opt::Instruction *)> f) {
+    def_use_.ForEachUser(inst, f);
+    if (inst->IsBlockTerminator()) {
+      // TODO: don't count labels for branch instructions
+      // we need to look at control dependencies
+      inst = context_.get_instr_block(inst)->GetLabelInst();
+    }
+    if (inst->opcode() == SpvOpLabel) {
+      uint32_t id = inst->result_id();
+      for (const spvtools::opt::ControlDependence &dep : cdg_.GetDependents(id)) {
+        uint32_t target = dep.target;
+        spvtools::opt::Instruction *target_inst = cfg_.block(target)->GetLabelInst();
+        f(target_inst);
+      }
+    }
+  }
+
+  VisitResult Visit(spvtools::opt::Instruction *inst) {
+    if (inst->opcode() == SpvOpLabel) {
+      return VisitBlock(inst->result_id());
+    } else {
+      return VisitInstruction(inst);
+    }
+  }
+
+  VisitResult VisitBlock(uint32_t id) {
+    if (blocks_.count(id)) {
+      return VisitResult::kResultFixed;
+    }
+    for (const spvtools::opt::ControlDependence &dep : cdg_.GetDependees(id)) {
+      if (blocks_.count(dep.source)) {
+        blocks_[id] = { IDType::kIDBlock, dep.source, 0 };
+        return VisitResult::kResultChanged;
+      } else if (dep.dependence_type != spvtools::opt::ControlDependence::DependenceType::kEntry &&
+                 values_.count(dep.dependent_value_label)) {
+        blocks_[id] = { IDType::kIDValue, dep.dependent_value_label, dep.source };
+        return VisitResult::kResultChanged;
+      }
+      if (dep.dependence_type != spvtools::opt::ControlDependence::DependenceType::kEntry) {
+      }
+    }
+    return VisitResult::kResultFixed;
+  }
+
+  VisitResult VisitInstruction(spvtools::opt::Instruction *inst) {
+    // if block terminator, return changed so that the block is visited
+    if (inst->IsBlockTerminator()) return VisitResult::kResultChanged;
+    if (!inst->HasResultId()) return VisitResult::kResultFixed;
+    uint32_t id = inst->result_id();
+    if (values_.count(id)) {
+      return VisitResult::kResultFixed;
+    }
+    if (InstructionIsDivergent(*inst)) {
+      values_[id] = { IDType::kIDValue, 0, 0 };
+      return VisitResult::kResultChanged;
+    }
+    if (InstructionIsNeverDivergent(*inst)) {
+      return VisitResult::kResultFixed;
+    }
+    bool is_uniform = inst->WhileEachInId([this, id](const uint32_t *op) {
+      if (!op) return true;
+      if (values_.count(*op)) {
+        values_[id] = { IDType::kIDValue, *op, 0 };
+        return false;
+      }
+      if (blocks_.count(*op)) {
+        values_[id] = { IDType::kIDBlock, *op, 0 };
+        return false;
+      }
+      return true;
+    });
+    return is_uniform ? VisitResult::kResultFixed : VisitResult::kResultChanged;
+  }
+
+ private:
+
+  bool Enqueue(spvtools::opt::Instruction *inst) {
+    bool &is_enqueued = on_worklist_[inst];
+    if (is_enqueued) return false;
+    is_enqueued = true;
+    worklist_.push_back(inst);
+    return true;
+  }
+
+  void EnqueueSuccessors(spvtools::opt::Instruction *inst) {
+    ForEachSuccessor(inst, [this](spvtools::opt::Instruction *succ) {
+      Enqueue(succ);
+    });
+  }
+
+ public:
+
+  void Run(spvtools::opt::Function *function) {
+    InitializeWorklist(function);
+    while (!worklist_.empty()) {
+      spvtools::opt::Instruction *top = worklist_.front();
+      worklist_.pop_front();
+      on_worklist_[top] = false;
+      VisitResult result = Visit(top);
+      if (result == VisitResult::kResultChanged) {
+        EnqueueSuccessors(top);
+      }
+    }
+  }
+
+ private:
+  DivergenceGraph blocks_;
+  DivergenceGraph values_;
+  std::map<spvtools::opt::Instruction *, bool> on_worklist_;
+  std::list<spvtools::opt::Instruction *> worklist_;
+  const spvtools::opt::analysis::DefUseManager &def_use_;
+  spvtools::opt::CFG &cfg_;
+  spvtools::opt::IRContext &context_;
+  spvtools::opt::ControlDependenceGraph &cdg_;
+};
 }
 
 namespace spvtools {
@@ -141,32 +310,17 @@ bool Linter::Run(const uint32_t *binary, const size_t binary_size) const {
     opt::ControlDependenceGraph cdg;
     cdg.InitializeGraph(cfg, pdom);
 
-    std::list<opt::BasicBlock *> order;
-    cfg.ComputeStructuredOrder(&func, func.entry().get(), &order);
-    DivergenceGraph divergent_blocks;
-    DivergenceGraph divergent_values;
-    for (opt::BasicBlock *bb : order) {
-      if (!cdg.DoesBlockExist(bb->id())) {
-        continue;
-      }
-      bool block_divergent = false;
-      for (opt::ControlDependence dep : cdg.GetDependees(bb->id())) {
-        if (divergent_blocks.count(dep.source)) {
-          block_divergent = true;
-          divergent_blocks[bb->id()] = { IDType::kIDBlock, dep.source, 0 };
-          break;
-        } else if (dep.dependence_type != opt::ControlDependence::DependenceType::kEntry &&
-                   IsValueDivergent(dep.dependent_value_label, divergent_values)) {
-          block_divergent = true;
-          divergent_blocks[bb->id()] = { IDType::kIDValue, dep.dependent_value_label, dep.source };
-          break;
-        }
-      }
-      for (const opt::Instruction &inst : *bb) {
-        if (InstructionHasDerivative(inst) && block_divergent) {
+    DivergenceDataFlowAnalysis div_analysis(*context, cdg);
+    div_analysis.Run(&func);
+    for (const opt::BasicBlock &bb : func) {
+      for (const opt::Instruction &inst : bb) {
+        if (InstructionHasDerivative(inst) && div_analysis.IsBlockDivergent(bb.id())) {
           DiagnosticStream({0, 0, 0}, impl_->consumer_, inst.PrettyPrint(), SPV_WARNING) << "derivative with non-uniform control flow"
-                                                                                         << " located in block %" << bb->id();
-          PrintDivergenceFlow(impl_->consumer_, cfg, *context->get_def_use_mgr(), divergent_blocks, divergent_values, IDType::kIDBlock, bb->id());
+                                                                                         << " located in block %" << bb.id();
+          PrintDivergenceFlow(impl_->consumer_, cfg, *context->get_def_use_mgr(),
+                              div_analysis.divergent_block_graph(),
+                              div_analysis.divergent_value_graph(),
+                              IDType::kIDBlock, bb.id());
         }
       }
     }
