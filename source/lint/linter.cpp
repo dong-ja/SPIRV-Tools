@@ -89,6 +89,9 @@ struct DivergenceEdge {
 
 using DivergenceGraph = std::map<uint32_t, DivergenceEdge>;
 
+// This will probably be controlled by a CLI flag eventually.
+const uint32_t kPrettyPrintOptions = SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES;
+
 void PrintDivergenceFlow(spvtools::MessageConsumer &consumer, spvtools::opt::CFG &cfg, spvtools::opt::analysis::DefUseManager &def_use, DivergenceGraph blocks, DivergenceGraph values, IDType id_type, uint32_t id) {
   while (id != 0) {
     spvtools::DiagnosticStream({0, 0, 0}, consumer, "", SPV_WARNING) << (id_type == IDType::kIDBlock ? "block" : "value") << " %" << id << " is non-uniform";
@@ -101,7 +104,7 @@ void PrintDivergenceFlow(spvtools::MessageConsumer &consumer, spvtools::opt::CFG
       }
       if (id == 0 || blocks[id].id == 0) break;
       spvtools::opt::Instruction *branch = cfg.block(blocks[id].source_id)->terminator();
-      spvtools::DiagnosticStream({0, 0, 0}, consumer, branch->PrettyPrint(), SPV_WARNING) << "because %" << id << " depends on conditional branch on non-uniform value %" << blocks[id].id;
+      spvtools::DiagnosticStream({0, 0, 0}, consumer, branch->PrettyPrint(kPrettyPrintOptions), SPV_WARNING) << "because %" << id << " depends on conditional branch on non-uniform value %" << blocks[id].id;
       id = blocks[id].id;
       id_type = IDType::kIDValue;
     } else {
@@ -110,17 +113,17 @@ void PrintDivergenceFlow(spvtools::MessageConsumer &consumer, spvtools::opt::CFG
           break;
         }
         spvtools::opt::Instruction *def = def_use.GetDef(id);
-        spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(), SPV_WARNING) << "because %" << id << " uses %" << values[id].id << " in its definition";
+        spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(kPrettyPrintOptions), SPV_WARNING) << "because %" << id << " uses %" << values[id].id << " in its definition";
         id = values[id].id;
       }
       if (id == 0) break;
       if (values[id].id == 0) {
         spvtools::opt::Instruction *def = def_use.GetDef(id);
-        spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(), SPV_WARNING) << "because it has a non-uniform definition";
+        spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(kPrettyPrintOptions), SPV_WARNING) << "because it has a non-uniform definition";
         break;
       }
       spvtools::opt::Instruction *def = def_use.GetDef(id);
-      spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(), SPV_WARNING) << "because it is conditionally set in block %" << values[id].id << ", which is non-uniform";
+      spvtools::DiagnosticStream({0, 0, 0}, consumer, def->PrettyPrint(kPrettyPrintOptions), SPV_WARNING) << "because it is conditionally set in block %" << values[id].id << ", which is non-uniform";
       id = values[id].id;
       id_type = IDType::kIDBlock;
     }
