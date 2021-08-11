@@ -54,13 +54,47 @@ bool InstructionHasDerivative(const spvtools::opt::Instruction &inst) {
   return std::find(std::begin(derivative_opcodes), std::end(derivative_opcodes), inst.opcode()) != std::end(derivative_opcodes);
 }
 
-bool InstructionIsDivergent(const spvtools::opt::Instruction &inst) {
+bool InstructionIsDivergent(spvtools::opt::IRContext &context, const spvtools::opt::Instruction &inst) {
   static const SpvOp divergent_opcodes[] = {
     // function parameters
     SpvOpFunctionParameter,
-    // memory loads
-    SpvOpLoad,
   };
+  if (inst.opcode() == SpvOpLoad) {
+    spvtools::opt::Instruction *def = context.get_def_use_mgr()->GetDef(inst.GetSingleWordInOperand(0));
+    uint32_t type_id = def->type_id();
+    spvtools::opt::analysis::Pointer *type = context.get_type_mgr()->GetType(type_id)->AsPointer();
+    assert(type != nullptr);
+    std::vector<spvtools::opt::Instruction *> decorations = context.get_decoration_mgr()->GetDecorationsFor(inst.result_id(), false);
+    bool is_flat = false;
+    for (spvtools::opt::Instruction *dec : decorations) {
+      if (dec->opcode() != SpvOpDecorate) continue;
+      uint32_t decoration_num = dec->GetSingleWordInOperand(1);
+      if (decoration_num == SpvDecorationFlat) {
+        is_flat = true;
+      }
+    }
+    switch (type->storage_class()) {
+      case SpvStorageClassFunction:
+      case SpvStorageClassGeneric:
+      case SpvStorageClassAtomicCounter:
+      case SpvStorageClassStorageBuffer:
+      case SpvStorageClassPhysicalStorageBuffer:
+      case SpvStorageClassOutput:
+        return true;
+      case SpvStorageClassInput:
+        return !is_flat;
+      case SpvStorageClassUniformConstant:
+      case SpvStorageClassUniform:
+      case SpvStorageClassWorkgroup:
+      case SpvStorageClassCrossWorkgroup:
+      case SpvStorageClassPrivate:
+      case SpvStorageClassPushConstant:
+      case SpvStorageClassImage:
+      default:
+        return false;
+    }
+    return true;
+  }
   return std::find(std::begin(divergent_opcodes), std::end(divergent_opcodes), inst.opcode()) != std::end(divergent_opcodes);
 }
 
@@ -218,7 +252,7 @@ class DivergenceDataFlowAnalysis {
     if (values_.count(id)) {
       return VisitResult::kResultFixed;
     }
-    if (InstructionIsDivergent(*inst)) {
+    if (InstructionIsDivergent(context_, *inst)) {
       values_[id] = { IDType::kIDValue, 0, 0 };
       return VisitResult::kResultChanged;
     }
